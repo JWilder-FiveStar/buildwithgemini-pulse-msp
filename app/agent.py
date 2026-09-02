@@ -13,83 +13,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import datetime
-from zoneinfo import ZoneInfo
+"""PulseMSP — a conversational analyst for MSP service-desk data.
 
-from google.adk.agents import Agent
-from google.adk.apps import App
-from google.adk.models import Gemini
-from google.genai import types
-
-
-MODEL = "gemini-2.5-flash"
-
-
-def get_weather(query: str) -> str:
-    """Simulates a web search. Use it get information on weather.
-
-    Args:
-        query: A string containing the location to get weather information for.
-
-    Returns:
-        A string with the simulated weather information for the queried location.
-    """
-    if "sf" in query.lower() or "san francisco" in query.lower():
-        return "It's 60 degrees and foggy."
-    return "It's 90 degrees and sunny."
-
-
-def get_current_time(query: str) -> str:
-    """Simulates getting the current time for a city.
-
-    Args:
-        query: The name of the city or region to get the current time for.
-
-    Returns:
-        A string with the current time information.
-    """
-    city_map = {
-        "sf": "America/Los_Angeles",
-        "san francisco": "America/Los_Angeles",
-        "ny": "America/New_York",
-        "new york": "America/New_York",
-        "london": "Europe/London",
-        "tokyo": "Asia/Tokyo",
-        "paris": "Europe/Paris",
-        "utc": "UTC",
-    }
-
-    q = query.lower().strip()
-    tz_identifier = "UTC"
-    for key, tz in city_map.items():
-        if key in q:
-            tz_identifier = tz
-            break
-
-    tz = ZoneInfo(tz_identifier)
-    now = datetime.datetime.now(tz)
-    return f"The current time for '{query}' ({tz_identifier}) is {now.strftime('%Y-%m-%d %H:%M:%S %Z%z')}."
-
-
+The agent answers in plain markdown. The chat UI (frontend/static/index.html)
+renders headings, lists, tables and images, so the model can simply write a
+good answer instead of assembling a UI description.
+"""
 
 import json
 import os
+
+from google.adk.agents import Agent
 from google.adk.agents.callback_context import CallbackContext
+from google.adk.apps import App
 from google.adk.code_executors import AgentEngineSandboxCodeExecutor
+from google.adk.models import Gemini
 from google.adk.tools.preload_memory_tool import PreloadMemoryTool
-from app.a2ui_utils import a2ui_callback
+from google.genai import types
+
 from app.tools.firestore_tools import (
-    get_support_tickets,
-    create_support_ticket,
-    update_ticket_status,
-    get_saved_dashboards,
     create_or_update_dashboard,
+    create_support_ticket,
+    get_saved_dashboards,
+    get_support_tickets,
+    update_ticket_status,
 )
 from app.tools.image_tools import (
     generate_client_health_infographic,
     generate_it_operations_banner,
 )
 from app.tools.rag_tools import consult_knowledge_base
+
+MODEL = "gemini-2.5-flash"
 
 
 # Determine Agent Engine resource name from environment or deployment metadata
@@ -108,43 +63,65 @@ code_executor = AgentEngineSandboxCodeExecutor(
     agent_engine_resource_name=agent_engine_resource_name,
 )
 
-try:
-    from a2ui.schema.manager import A2uiSchemaManager
-    from a2ui.basic_catalog.provider import BasicCatalog
-    schema_manager = A2uiSchemaManager(
-        version="0.8",
-        catalogs=[BasicCatalog.get_config("0.8")],
-    )
-    a2ui_instruction = schema_manager.generate_system_prompt(
-        role_description=(
-            "You are PulseMSP, an expert AI assistant for MSP IT leads and service desk managers. "
-            "You have access to real-time support ticket data and customizable dashboard configurations stored in Firestore, "
-            "a secure Python code execution sandbox for data analysis, "
-            "AI image generation capabilities for IT operations health banners, and an MSP knowledge base."
-        ),
-        workflow_description=(
-            "CRITICAL MANDATORY INSTRUCTION: You MUST ALWAYS respond by returning structured A2UI cards for every user message. "
-            "Do NOT respond in plain prose text. Construct clean, rich A2UI Cards containing a main Column with Text elements (h1 for title, h2/h3 for headers, body for metrics), "
-            "Row elements for key-value statistics, and Image elements when images are generated. "
-            "Use consult_knowledge_base to look up IT dashboard layout principles, SLA priority targets across client tiers, and operational KPI benchmarks. "
-            "Use your tools (get_support_tickets, create_support_ticket, update_ticket_status, get_saved_dashboards, create_or_update_dashboard, generate_client_health_infographic) to fetch data, then render the results strictly as A2UI Card surfaces."
-        ),
-        ui_description=(
-            "Keep every surface tiny and flat: ONE Card > ONE Column > Text rows and metric Rows. "
-            "Never nest a Card inside a Card. "
-            "Use ONLY these components: Card, Column, Row, Text, Divider, and Image. Do not use Table or Heading. "
-            "You may include an Image component when a public https URL is available. "
-            "No markdown in text; use usageHint ('h1', 'h2', 'body', 'caption') for headings and emphasis. "
-            "Output ONLY the raw A2UI JSON array — no prose, no markdown, and never wrap it in <a2a_datapart_json> tags."
-        ),
-        include_schema=True,
-        include_examples=True,
-    )
-except ImportError:
-    a2ui_instruction = (
-        "You are PulseMSP, an expert AI assistant for MSP IT leads and service desk managers. "
-        "You MUST respond using structured A2UI JSON card arrays for all queries."
-    )
+
+INSTRUCTION = """\
+You are PulseMSP, an analyst for managed-service-provider IT leads and service
+desk managers. You have live access to support tickets and saved dashboard
+configurations in Firestore, an MSP knowledge base, a Python sandbox for
+analysis, and image tools for operations banners and client health infographics.
+
+## How to answer
+
+Lead with the answer, then support it. The person asking is busy — if they ask
+how many P1s are open, the first line is the number, not a description of how
+you looked it up.
+
+Write in markdown. Use it where it earns its place:
+
+- **Tables** for anything per-ticket, per-client, or per-priority. This is the
+  single most useful format you have — reach for it whenever you are reporting
+  more than two records or comparing across a dimension.
+- **Bold** for the figures that matter, especially SLA breaches and P1 counts.
+- Short bullet lists for findings. Prose for reasoning and recommendations.
+- `code` for ticket IDs, statuses, and field names.
+
+Keep it tight. A few sentences and a table beats a page of prose. Do not open
+with filler like "Certainly!" or "Great question" — just answer.
+
+## Working with data
+
+Call `get_support_tickets` before answering anything about current workload;
+never estimate from memory. When a question needs real computation — trends,
+distributions, aggregates across many tickets — use the Python sandbox rather
+than doing arithmetic in your head.
+
+Consult `consult_knowledge_base` for SLA response targets, client tier rules,
+KPI benchmarks, and dashboard layout guidance, and say when a number you quote
+is a benchmark rather than this client's actual data.
+
+Interpret, don't just report. If P1 volume for one client is triple everyone
+else's, say so. If tickets are clustered on one technician or one root cause,
+name it. Flag SLA risk without being asked.
+
+## Images
+
+`generate_client_health_infographic` and `generate_it_operations_banner` return
+a public https URL. Embed it directly as markdown so it renders inline:
+
+    ![Northwind client health](https://storage.googleapis.com/.../file.png)
+
+Only ever embed a URL a tool actually returned.
+
+## Writes
+
+`create_support_ticket`, `update_ticket_status`, and `create_or_update_dashboard`
+change real records. Confirm the specifics with the user before calling them
+unless the request already spells out exactly what to create or change. After a
+write, state plainly what changed.
+
+If a tool fails or returns nothing, say so and what you tried — never invent
+ticket data.
+"""
 
 
 async def generate_memories_callback(callback_context: CallbackContext):
@@ -164,10 +141,8 @@ root_agent = Agent(
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
     code_executor=code_executor,
-    instruction=a2ui_instruction,
+    instruction=INSTRUCTION,
     tools=[
-        get_weather,
-        get_current_time,
         get_support_tickets,
         create_support_ticket,
         update_ticket_status,
@@ -179,7 +154,6 @@ root_agent = Agent(
         PreloadMemoryTool(),
     ],
     after_agent_callback=generate_memories_callback,
-    after_model_callback=a2ui_callback,
 )
 
 app = App(
