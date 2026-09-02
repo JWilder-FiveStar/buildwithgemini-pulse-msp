@@ -102,26 +102,59 @@ async def _get_card(client: httpx.AsyncClient) -> AgentCard:
     return _card
 
 
+def _file_markdown(uri: str) -> str:
+    """A generated file becomes an inline image when it looks like one."""
+    if uri.lower().endswith(_IMAGE_SUFFIXES):
+        return f"\n\n![generated image]({uri})\n\n"
+    return f"\n\n[{uri}]({uri})\n\n"
+
+
 def _artifact_text(parts: list) -> str:
     """Flatten one artifact's parts into markdown.
 
-    Text parts pass through as-is. File parts become a markdown image when the
-    URI looks like one, and a link otherwise, so generated infographics render
-    inline instead of arriving as a bare URL.
+    Text is read by duck-typing rather than isinstance: depending on the SDK
+    path a reply can arrive as a TextPart, as a Blob/inline_data carrying utf-8
+    bytes, or as a plain dict. Matching only TextPart silently dropped those and
+    the turn looked empty. File parts become a markdown image when the URI looks
+    like one, so generated infographics render inline instead of as a bare URL.
     """
     out: list[str] = []
-    for p in parts:
+    for p in parts or []:
         root = getattr(p, "root", p)
-        if isinstance(root, TextPart) and getattr(root, "text", None):
-            out.append(root.text)
-        elif isinstance(root, FilePart):
+
+        text = getattr(root, "text", None)
+        if isinstance(text, str) and text.strip():
+            out.append(text)
+            continue
+
+        if isinstance(root, FilePart):
             uri = getattr(getattr(root, "file", None), "uri", None)
-            if not uri:
+            if uri:
+                out.append(_file_markdown(uri))
+            continue
+
+        # Blob / inline_data / data carrying utf-8 bytes.
+        blob = (
+            getattr(root, "inline_data", None)
+            or getattr(root, "blob", None)
+            or getattr(root, "data", None)
+        )
+        if blob is not None:
+            raw = blob if isinstance(blob, (str, bytes)) else getattr(blob, "data", None)
+            if isinstance(raw, bytes):
+                try:
+                    raw = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    raw = None
+            if isinstance(raw, str) and raw.strip():
+                out.append(raw)
                 continue
-            if uri.lower().endswith(_IMAGE_SUFFIXES):
-                out.append(f"\n\n![generated image]({uri})\n\n")
-            else:
-                out.append(f"\n\n[{uri}]({uri})\n\n")
+
+        if isinstance(root, dict):
+            if isinstance(root.get("text"), str) and root["text"].strip():
+                out.append(root["text"])
+            elif isinstance(root.get("file"), dict) and root["file"].get("uri"):
+                out.append(_file_markdown(root["file"]["uri"]))
     return "".join(out)
 
 
@@ -195,12 +228,21 @@ async def _run_turn(message: str, user_id: str) -> AsyncIterator[str]:
                     yield _sse({"type": "replace", "text": full})
                 emitted = full
 
-            # Non-streaming fallback: pull the reply from the final task's artifacts.
+            # Non-streaming fallback: pull the reply from the final task, first
+            # from its artifacts and then from its history, since which of the
+            # two carries the reply depends on the deployment path.
             if not emitted and last_task is not None:
                 full = "".join(
-                    _artifact_text(a.parts)
+                    _artifact_text(getattr(a, "parts", None))
                     for a in (getattr(last_task, "artifacts", None) or [])
                 )
+                if not full:
+                    history = (
+                        getattr(last_task, "history", None)
+                        or getattr(last_task, "messages", None)
+                        or []
+                    )
+                    full = "".join(_artifact_text(getattr(h, "parts", None)) for h in history)
                 if full:
                     yield _sse({"type": "replace", "text": full})
                     emitted = full
