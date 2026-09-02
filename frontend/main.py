@@ -112,28 +112,69 @@ async def _get_card(client: httpx.AsyncClient) -> AgentCard:
     return _card
 
 
-def _extract_parts(parts: list) -> list[dict]:
-    """Turn A2A response parts into structured parts for the chat UI.
+import json
+import re
 
-    Text parts pass through as {"kind": "text"}. A2UI data parts (tagged
-    application/json+a2ui) become {"kind": "a2ui", "data": <message>} so the UI
-    renders the card; each data part is one A2UI message (beginRendering or
-    surfaceUpdate).
-    """
+def _extract_parts(parts: list) -> list[dict]:
+    """Turn A2A response parts into structured parts for the chat UI."""
     out: list[dict] = []
+    if not parts:
+        return out
+
     for p in parts:
         root = getattr(p, "root", p)
-        if isinstance(root, TextPart) and getattr(root, "text", None):
-            out.append({"kind": "text", "text": root.text})
-        elif getattr(root, "data", None) is not None:
-            meta = getattr(root, "metadata", None) or {}
-            mime = meta.get("mimeType") if isinstance(meta, dict) else None
-            if mime == _A2UI_MIME:
-                out.append({"kind": "a2ui", "data": root.data})
-        elif isinstance(root, FilePart):
+
+        # 1. TextPart or object with text attribute
+        text_val = getattr(root, "text", None)
+        if isinstance(text_val, str) and text_val.strip():
+            if "<a2a_datapart_json>" in text_val:
+                try:
+                    clean_json = text_val.replace("<a2a_datapart_json>", "").replace("</a2a_datapart_json>", "").strip()
+                    parsed = json.loads(clean_json)
+                    data_obj = parsed.get("data") if isinstance(parsed, dict) else parsed
+                    out.append({"kind": "a2ui", "data": data_obj})
+                    continue
+                except Exception:
+                    pass
+            out.append({"kind": "text", "text": text_val})
+            continue
+
+        # 2. Blob / inline_data / bytes / data
+        blob = getattr(root, "inline_data", None) or getattr(root, "blob", None) or getattr(root, "data", None)
+        if blob is not None:
+            raw_bytes = getattr(blob, "data", blob) if not isinstance(blob, (str, dict, list)) else blob
+            if isinstance(raw_bytes, bytes):
+                try:
+                    decoded = raw_bytes.decode("utf-8")
+                    if "<a2a_datapart_json>" in decoded:
+                        clean_json = decoded.replace("<a2a_datapart_json>", "").replace("</a2a_datapart_json>", "").strip()
+                        parsed = json.loads(clean_json)
+                        data_obj = parsed.get("data") if isinstance(parsed, dict) else parsed
+                        out.append({"kind": "a2ui", "data": data_obj})
+                        continue
+                    elif decoded.strip():
+                        out.append({"kind": "text", "text": decoded})
+                        continue
+                except Exception:
+                    pass
+            elif isinstance(raw_bytes, dict):
+                out.append({"kind": "a2ui", "data": raw_bytes})
+                continue
+
+        # 3. FilePart
+        if isinstance(root, FilePart):
             uri = getattr(getattr(root, "file", None), "uri", None)
             if uri:
                 out.append({"kind": "text", "text": uri})
+                continue
+
+        # 4. Fallback: dict inspection
+        if isinstance(root, dict):
+            if "text" in root and root["text"]:
+                out.append({"kind": "text", "text": root["text"]})
+            elif "data" in root:
+                out.append({"kind": "a2ui", "data": root["data"]})
+
     return out
 
 
@@ -178,14 +219,15 @@ async def chat(req: Request):
                 got_artifact_update = True
                 parts.extend(_extract_parts(update.artifact.parts))
 
-        # Non-streaming fallback: pull parts from the final task's artifacts.
-        if not got_artifact_update and last_task is not None:
+        # Comprehensive fallback: pull parts from artifacts, history, or messages
+        if not parts and last_task is not None:
             for artifact in getattr(last_task, "artifacts", None) or []:
-                parts.extend(_extract_parts(artifact.parts))
+                parts.extend(_extract_parts(getattr(artifact, "parts", [])))
+            if not parts:
+                for history_item in getattr(last_task, "history", None) or getattr(last_task, "messages", None) or []:
+                    parts.extend(_extract_parts(getattr(history_item, "parts", [])))
 
     if not parts:
-        # The turn produced no text or UI (e.g. the agent only ran tools, or a
-        # tool stalled). Be honest rather than silent.
         parts = [{"kind": "text", "text": "(The agent didn't return a reply.)"}]
     return JSONResponse({"parts": parts})
 

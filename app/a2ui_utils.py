@@ -217,11 +217,40 @@ def _surface_is_renderable(messages: list[dict]) -> bool:
     return True
 
 
+def _text_to_a2ui_card(text: str) -> list[dict]:
+    """Convert plain text response into a structured A2UI Card message array."""
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    title = "PulseMSP Operational Card"
+    body_text = text
+    
+    if lines and lines[0].startswith("Here is"):
+        title = lines[0]
+        body_text = "\n".join(lines[1:])
+    elif lines:
+        title = lines[0].replace("#", "").strip()
+        body_text = "\n".join(lines[1:]) if len(lines) > 1 else text
+
+    return [
+        {"beginRendering": {"surfaceId": "main_card", "root": "card_root"}},
+        {
+            "surfaceUpdate": {
+                "surfaceId": "main_card",
+                "components": [
+                    {"id": "card_root", "component": {"Card": {"child": "col_root"}}},
+                    {"id": "col_root", "component": {"Column": {"children": {"explicitList": ["title_txt", "body_txt"]}}}},
+                    {"id": "title_txt", "component": {"Text": {"text": {"literalString": title}, "usageHint": "h2"}}},
+                    {"id": "body_txt", "component": {"Text": {"text": {"literalString": body_text}, "usageHint": "body"}}}
+                ]
+            }
+        }
+    ]
+
+
 def a2ui_callback(
     callback_context: CallbackContext,
     llm_response: LlmResponse,
 ) -> LlmResponse | None:
-    """Convert A2UI JSON in text output to rendered components (or a clean fallback)."""
+    """Convert A2UI JSON or plain text output into rendered A2UI Card components."""
     if not llm_response.content or not llm_response.content.parts:
         return None
 
@@ -229,11 +258,8 @@ def a2ui_callback(
         text = (part.text or "").strip()
         if not text:
             continue
-        # Cheap gate: only touch parts that look like A2UI, leave prose alone.
-        if not any(k in text for k in _A2UI_KEYS):
-            continue
 
-        messages = _extract_a2ui_messages(text)
+        messages = _extract_a2ui_messages(text) if any(k in text for k in _A2UI_KEYS) else _text_to_a2ui_card(text)
         if not messages:
             continue
 
@@ -241,14 +267,7 @@ def a2ui_callback(
         _sanitize_image_components(messages)
 
         if not _surface_is_renderable(messages):
-            # We recognized A2UI but couldn't recover a renderable surface — the
-            # model emitted invalid JSON, a missing surface body, or an undefined
-            # root/child reference. Return clean text instead of a blank card.
-            return LlmResponse(
-                content=types.Content(
-                    role="model", parts=[types.Part(text=_FALLBACK_TEXT)]
-                )
-            )
+            messages = _text_to_a2ui_card(text)
 
         new_parts = [_wrap_a2ui_part(m) for m in messages]
         return LlmResponse(

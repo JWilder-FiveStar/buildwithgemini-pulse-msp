@@ -123,28 +123,19 @@ try:
             "AI image generation capabilities for IT operations health banners, and an MSP knowledge base."
         ),
         workflow_description=(
-            "Analyze the user's request and return structured A2UI cards or layouts when appropriate. "
+            "CRITICAL MANDATORY INSTRUCTION: You MUST ALWAYS respond by returning structured A2UI cards for every user message. "
+            "Do NOT respond in plain prose text. Construct clean, rich A2UI Cards containing a main Column with Text elements (h1 for title, h2/h3 for headers, body for metrics), "
+            "Row elements for key-value statistics, and Image elements when images are generated. "
             "Use consult_knowledge_base to look up IT dashboard layout principles, SLA priority targets across client tiers, and operational KPI benchmarks. "
-            "Use generate_it_operations_banner to generate AI images and banners for IT operations health status displays. "
-            "Use your other tools (get_support_tickets, create_support_ticket, update_ticket_status, get_saved_dashboards, create_or_update_dashboard, generate_client_health_infographic) "
-            "to answer questions or take actions."
+            "Use your tools (get_support_tickets, create_support_ticket, update_ticket_status, get_saved_dashboards, create_or_update_dashboard, generate_client_health_infographic) to fetch data, then render the results strictly as A2UI Card surfaces."
         ),
         ui_description=(
-            "Keep every surface tiny and flat: ONE Card > ONE Column > a few Text rows. "
+            "Keep every surface tiny and flat: ONE Card > ONE Column > Text rows and metric Rows. "
             "Never nest a Card inside a Card. "
-            "Use ONLY these components: Card, Column, Row, Text, and Image. Do not use "
-            "Table or Heading (unsupported), or Buttons, actions, or forms (they do "
-            "nothing in adk web). "
-            "You may include one Image component, but only when you have a public https "
-            "URL for the image (for example the URL an image tool returns after uploading "
-            "to a public bucket). Set the Image url to that exact https link, for example "
-            "{\"Image\": {\"url\": {\"literalString\": \"https://...\"}}}. Never point an "
-            "Image at a bare filename, an artifact name, or a non-http(s) path. If you do "
-            "not have a public URL, add a short Text line noting the image instead. "
-            "No markdown in text; use the usageHint property ('h1', 'h2', 'body') for "
-            "headings and emphasis. "
-            "Output ONLY the raw A2UI JSON array — no prose, and never wrap it in "
-            "<a2a_datapart_json> tags or 'kind'/'data'/'metadata' objects."
+            "Use ONLY these components: Card, Column, Row, Text, Divider, and Image. Do not use Table or Heading. "
+            "You may include an Image component when a public https URL is available. "
+            "No markdown in text; use usageHint ('h1', 'h2', 'body', 'caption') for headings and emphasis. "
+            "Output ONLY the raw A2UI JSON array — no prose, no markdown, and never wrap it in <a2a_datapart_json> tags."
         ),
         include_schema=True,
         include_examples=True,
@@ -152,9 +143,7 @@ try:
 except ImportError:
     a2ui_instruction = (
         "You are PulseMSP, an expert AI assistant for MSP IT leads and service desk managers. "
-        "You have access to real-time support ticket data and customizable dashboard configurations stored in Firestore, "
-        "a secure Python code execution sandbox for data analysis, "
-        "AI image generation capabilities for IT operations health banners, and an MSP knowledge base."
+        "You MUST respond using structured A2UI JSON card arrays for all queries."
     )
 
 
