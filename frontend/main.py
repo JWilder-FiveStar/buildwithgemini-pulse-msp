@@ -2,12 +2,16 @@
 
 The browser talks ONLY to this proxy (same origin, no CORS, no GCP creds in the
 browser). The proxy authenticates with Application Default Credentials and
-forwards chat to the deployed agent over the A2A protocol, returning replies as
-structured parts the chat UI knows how to show:
+forwards chat to the deployed agent over the A2A protocol, streaming the reply
+back as server-sent events so text appears as the model writes it:
 
-  * {"kind": "text", "text": ...}  -> a normal chat bubble
-  * {"kind": "a2ui", "data": ...}  -> one A2UI message (beginRendering /
-    surfaceUpdate); static/index.html renders these as a card.
+  * {"type": "delta",   "text": ...}  -> append to the current reply
+  * {"type": "replace", "text": ...}  -> the agent revised the whole reply
+  * {"type": "error",   "text": ...}  -> show as an error
+  * {"type": "done"}                  -> turn finished
+
+Replies are plain markdown; static/index.html renders them. There is no UI
+protocol in between.
 
 Why A2A: agents-cli 1.1.0 (GA) deploys ADK agents to Agent Runtime as A2A agents
 and no longer registers the reasoning-engine operation schema the old
@@ -24,8 +28,10 @@ Run:
   python main.py                 # -> http://localhost:8080
 """
 
+import json
 import os
 import uuid
+from collections.abc import AsyncIterator
 
 import google.auth
 import google.auth.transport.requests
@@ -42,7 +48,7 @@ from a2a.types import (
     TransportProtocol,
 )
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 RESOURCE = os.environ["AGENT_ENGINE_RESOURCE_NAME"]
@@ -59,8 +65,7 @@ A2A_BASE = (
 )
 A2A_CARD_URL = f"{A2A_BASE}/.well-known/agent-card.json"
 
-# The agent tags its A2UI data parts with this mime type.
-_A2UI_MIME = "application/json+a2ui"
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")
 
 # One set of ADC credentials, refreshed per request (access tokens expire ~1h).
 _creds, _ = google.auth.default(
@@ -77,21 +82,6 @@ def _auth_headers() -> dict[str, str]:
 
 
 app = FastAPI()
-
-
-@app.exception_handler(Exception)
-async def _json_errors(request: Request, exc: Exception):
-    # Always return JSON so the browser never receives a plain-text 500 page
-    # (which shows up in the chat as "Unexpected token 'I', "Internal S"... is
-    # not valid JSON"). Any server-side failure now surfaces as a readable
-    # message in the chat bubble instead.
-    return JSONResponse(
-        status_code=200,
-        content={
-            "parts": [{"kind": "text", "text": f"Error: {type(exc).__name__}: {exc}"}]
-        },
-    )
-
 
 # Reuse ONE A2A context per user so the agent remembers the conversation.
 _contexts: dict[str, str] = {}
@@ -112,124 +102,127 @@ async def _get_card(client: httpx.AsyncClient) -> AgentCard:
     return _card
 
 
-import json
-import re
+def _artifact_text(parts: list) -> str:
+    """Flatten one artifact's parts into markdown.
 
-def _extract_parts(parts: list) -> list[dict]:
-    """Turn A2A response parts into structured parts for the chat UI."""
-    out: list[dict] = []
-    if not parts:
-        return out
-
+    Text parts pass through as-is. File parts become a markdown image when the
+    URI looks like one, and a link otherwise, so generated infographics render
+    inline instead of arriving as a bare URL.
+    """
+    out: list[str] = []
     for p in parts:
         root = getattr(p, "root", p)
-
-        # 1. TextPart or object with text attribute
-        text_val = getattr(root, "text", None)
-        if isinstance(text_val, str) and text_val.strip():
-            if "<a2a_datapart_json>" in text_val:
-                try:
-                    clean_json = text_val.replace("<a2a_datapart_json>", "").replace("</a2a_datapart_json>", "").strip()
-                    parsed = json.loads(clean_json)
-                    data_obj = parsed.get("data") if isinstance(parsed, dict) else parsed
-                    out.append({"kind": "a2ui", "data": data_obj})
-                    continue
-                except Exception:
-                    pass
-            out.append({"kind": "text", "text": text_val})
-            continue
-
-        # 2. Blob / inline_data / bytes / data
-        blob = getattr(root, "inline_data", None) or getattr(root, "blob", None) or getattr(root, "data", None)
-        if blob is not None:
-            raw_bytes = getattr(blob, "data", blob) if not isinstance(blob, (str, dict, list)) else blob
-            if isinstance(raw_bytes, bytes):
-                try:
-                    decoded = raw_bytes.decode("utf-8")
-                    if "<a2a_datapart_json>" in decoded:
-                        clean_json = decoded.replace("<a2a_datapart_json>", "").replace("</a2a_datapart_json>", "").strip()
-                        parsed = json.loads(clean_json)
-                        data_obj = parsed.get("data") if isinstance(parsed, dict) else parsed
-                        out.append({"kind": "a2ui", "data": data_obj})
-                        continue
-                    elif decoded.strip():
-                        out.append({"kind": "text", "text": decoded})
-                        continue
-                except Exception:
-                    pass
-            elif isinstance(raw_bytes, dict):
-                out.append({"kind": "a2ui", "data": raw_bytes})
-                continue
-
-        # 3. FilePart
-        if isinstance(root, FilePart):
+        if isinstance(root, TextPart) and getattr(root, "text", None):
+            out.append(root.text)
+        elif isinstance(root, FilePart):
             uri = getattr(getattr(root, "file", None), "uri", None)
-            if uri:
-                out.append({"kind": "text", "text": uri})
+            if not uri:
                 continue
+            if uri.lower().endswith(_IMAGE_SUFFIXES):
+                out.append(f"\n\n![generated image]({uri})\n\n")
+            else:
+                out.append(f"\n\n[{uri}]({uri})\n\n")
+    return "".join(out)
 
-        # 4. Fallback: dict inspection
-        if isinstance(root, dict):
-            if "text" in root and root["text"]:
-                out.append({"kind": "text", "text": root["text"]})
-            elif "data" in root:
-                out.append({"kind": "a2ui", "data": root["data"]})
 
-    return out
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+async def _run_turn(message: str, user_id: str) -> AsyncIterator[str]:
+    """Send one message to the agent and yield SSE frames as the reply arrives."""
+    # Accumulate per artifact, then stream the growing concatenation. A2A lets an
+    # artifact update either append to or replace its artifact, so we track both
+    # and tell the browser which one happened rather than guessing.
+    buffers: dict[str, str] = {}
+    order: list[str] = []
+    emitted = ""
+
+    def merged() -> str:
+        return "".join(buffers[a] for a in order)
+
+    try:
+        async with httpx.AsyncClient(headers=_auth_headers(), timeout=180) as client:
+            card = await _get_card(client)
+            factory = ClientFactory(
+                ClientConfig(
+                    streaming=True,
+                    supported_transports=[
+                        TransportProtocol.jsonrpc,
+                        TransportProtocol.http_json,
+                    ],
+                    httpx_client=client,
+                )
+            )
+            a2a_client = factory.create(card)
+
+            msg = Message(
+                message_id=str(uuid.uuid4()),
+                role=Role.user,
+                parts=[Part(root=TextPart(text=message))],
+                context_id=_contexts.get(user_id),
+            )
+
+            last_task = None
+            async for event in a2a_client.send_message(msg):
+                if not isinstance(event, tuple):
+                    continue
+                task, update = event
+                if task is not None:
+                    last_task = task
+                    if getattr(task, "context_id", None):
+                        _contexts[user_id] = task.context_id
+                if not isinstance(update, TaskArtifactUpdateEvent):
+                    continue
+
+                aid = getattr(update.artifact, "artifact_id", "") or "default"
+                if aid not in buffers:
+                    buffers[aid] = ""
+                    order.append(aid)
+                chunk = _artifact_text(update.artifact.parts)
+                if getattr(update, "append", False):
+                    buffers[aid] += chunk
+                else:
+                    buffers[aid] = chunk
+
+                full = merged()
+                if full == emitted:
+                    continue
+                if full.startswith(emitted):
+                    yield _sse({"type": "delta", "text": full[len(emitted) :]})
+                else:
+                    # The agent rewrote earlier text; resend the whole reply.
+                    yield _sse({"type": "replace", "text": full})
+                emitted = full
+
+            # Non-streaming fallback: pull the reply from the final task's artifacts.
+            if not emitted and last_task is not None:
+                full = "".join(
+                    _artifact_text(a.parts)
+                    for a in (getattr(last_task, "artifacts", None) or [])
+                )
+                if full:
+                    yield _sse({"type": "replace", "text": full})
+                    emitted = full
+
+        if not emitted:
+            # The turn produced nothing (e.g. the agent only ran tools, or a tool
+            # stalled). Be honest rather than silent.
+            yield _sse({"type": "error", "text": "The agent didn't return a reply."})
+    except Exception as exc:  # surface failures in the chat, not as a dead stream
+        yield _sse({"type": "error", "text": f"{type(exc).__name__}: {exc}"})
+
+    yield _sse({"type": "done"})
 
 
 @app.post("/chat")
-async def chat(req: Request):
+async def chat(req: Request) -> StreamingResponse:
     body = await req.json()
-    message = body.get("message", "")
-    user_id = body.get("user_id") or "web-user"
-    parts: list[dict] = []
-
-    async with httpx.AsyncClient(headers=_auth_headers(), timeout=120) as client:
-        card = await _get_card(client)
-        factory = ClientFactory(
-            ClientConfig(
-                supported_transports=[
-                    TransportProtocol.jsonrpc,
-                    TransportProtocol.http_json,
-                ],
-                httpx_client=client,
-            )
-        )
-        a2a_client = factory.create(card)
-
-        msg = Message(
-            message_id=str(uuid.uuid4()),
-            role=Role.user,
-            parts=[Part(root=TextPart(text=message))],
-            context_id=_contexts.get(user_id),
-        )
-
-        last_task = None
-        got_artifact_update = False
-        async for event in a2a_client.send_message(msg):
-            if not isinstance(event, tuple):
-                continue
-            task, update = event
-            if task is not None:
-                last_task = task
-                if getattr(task, "context_id", None):
-                    _contexts[user_id] = task.context_id
-            if isinstance(update, TaskArtifactUpdateEvent):
-                got_artifact_update = True
-                parts.extend(_extract_parts(update.artifact.parts))
-
-        # Comprehensive fallback: pull parts from artifacts, history, or messages
-        if not parts and last_task is not None:
-            for artifact in getattr(last_task, "artifacts", None) or []:
-                parts.extend(_extract_parts(getattr(artifact, "parts", [])))
-            if not parts:
-                for history_item in getattr(last_task, "history", None) or getattr(last_task, "messages", None) or []:
-                    parts.extend(_extract_parts(getattr(history_item, "parts", [])))
-
-    if not parts:
-        parts = [{"kind": "text", "text": "(The agent didn't return a reply.)"}]
-    return JSONResponse({"parts": parts})
+    return StreamingResponse(
+        _run_turn(body.get("message", ""), body.get("user_id") or "web-user"),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # Serve the chat UI (keep this mount last so /chat wins).
